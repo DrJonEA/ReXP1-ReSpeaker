@@ -31,6 +31,7 @@ Run:
 import argparse
 import json
 import re
+import statistics
 import subprocess
 import sys
 import time
@@ -249,23 +250,85 @@ def rms(block: np.ndarray) -> float:
     return float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
 
 
-def record_command(stream) -> np.ndarray:
-    """Read from the open stream until silence or the time limit. Returns int16 audio."""
+def record_command(stream):
+    """Read from the open stream until silence or the time limit.
+    Returns (int16 audio, info) where info holds the speech timing within the clip, in seconds."""
     frames, quiet_time, speech_time, total = [], 0.0, 0.0, 0.0
+    first_speech = None
     block_s = CHUNK / RATE
     while total < MAX_COMMAND_SECONDS:
         block, _ = stream.read(CHUNK)
         block = block[:, 0]
         frames.append(block.copy())
-        total += block_s
         if rms(block) >= SILENCE_RMS:
+            if first_speech is None:
+                first_speech = total
             speech_time += block_s
             quiet_time = 0.0
         else:
             quiet_time += block_s
-            if speech_time >= MIN_SPEECH_SECONDS and quiet_time >= SILENCE_SECONDS:
-                break
-    return np.concatenate(frames) if frames else np.zeros(0, dtype=np.int16)
+        total += block_s
+        if speech_time >= MIN_SPEECH_SECONDS and quiet_time >= SILENCE_SECONDS:
+            break
+    audio = np.concatenate(frames) if frames else np.zeros(0, dtype=np.int16)
+    info = {"duration": total, "speech": speech_time, "trailing_quiet": quiet_time,
+            "first_speech": first_speech, "backlog": stream.read_available / RATE}
+    return audio, info
+
+
+class Timings:
+    """Per-command timing breakdown plus running stats across all commands."""
+
+    def __init__(self):
+        self.history = {}           # metric -> list of ms values, one per command
+
+    def report(self, t, rec, input_latency):
+        ms = lambda a, b: (t[b] - t[a]) * 1000
+        # The last block read is (almost) live, so end of speech was trailing_quiet
+        # seconds of audio plus the input buffer latency before recording stopped.
+        # Any backlog still queued means the clip ended that much earlier than "now".
+        eos_to_rec_end = (rec["trailing_quiet"] + input_latency + rec["backlog"]) * 1000
+        post_rec = ms("rec_end", "think")
+        whisper = ms("think", "transcribed")
+        norm = ms("transcribed", "text")
+        latency = eos_to_rec_end + ms("rec_end", "text")
+        rows = [
+            ("wake predict (trigger frame)", ms("predict", "wake")),
+            ("DOA read", ms("wake", "doa")),
+            ("wake chirp + pico listen", ms("doa", "chirped")),
+            ("recording", ms("chirped", "rec_end")),
+            ("done chirp + pico think", post_rec),
+            ("whisper transcribe", whisper),
+            ("normalise", norm),
+            ("dispatch + pico restore", ms("text", "dispatched")),
+            ("drain buffered audio", ms("dispatched", "drained")),
+            ("total (wake -> listening)", ms("wake", "drained")),
+        ]
+        audio_s = rec["duration"]
+        first = rec["first_speech"]
+        print("  timings:")
+        for name, v in rows:
+            print(f"    {name:<30}{v:8.0f} ms")
+        print(f"    {'':<30}clip {audio_s * 1000:.0f} ms: speech {rec['speech'] * 1000:.0f} ms, "
+              f"first speech at {'-' if first is None else f'{first * 1000:.0f}'} ms, "
+              f"trailing quiet {rec['trailing_quiet'] * 1000:.0f} ms")
+        if audio_s:
+            print(f"    {'':<30}whisper RTF {whisper / 1000 / audio_s:.2f} (transcribe time / clip length)")
+        print(f"  latency (end of speech -> text): {latency:.0f} ms")
+        print(f"    = silence wait {rec['trailing_quiet'] * 1000:.0f} + input buffer {input_latency * 1000:.0f}"
+              f" + backlog {rec['backlog'] * 1000:.0f} + done chirp/pico {post_rec:.0f}"
+              f" + whisper {whisper:.0f} + normalise {norm:.0f} ms")
+        print(f"  latency (end of speech -> action done): {latency + ms('text', 'dispatched'):.0f} ms")
+
+        for key, v in (("latency", latency), ("whisper", whisper),
+                       ("recording", ms("chirped", "rec_end")), ("total", ms("wake", "drained"))):
+            self.history.setdefault(key, []).append(v)
+        n = len(self.history["latency"])
+        print(f"  stats over {n} command{'s' if n != 1 else ''} (ms):")
+        print(f"    {'':<30}{'min':>7}{'mean':>7}{'median':>7}{'max':>7}")
+        for key, vals in self.history.items():
+            print(f"    {key:<30}{min(vals):7.0f}{statistics.mean(vals):7.0f}"
+                  f"{statistics.median(vals):7.0f}{max(vals):7.0f}")
 
 
 # ----------------------------------------------------------------------------
@@ -347,9 +410,12 @@ def main():
         dev = sd.query_devices(args.device, "input")
         print(f"Input device: [{dev['index']}] {dev['name']}")
         print(f"Listening for '{wake_key}'... (Ctrl+C to quit)")
+        input_latency = stream.latency    # seconds of audio buffered in the input path
+        timings = Timings()
         peak_rms, peak_score, n = 0.0, 0.0, 0
         while True:
             block, overflowed = stream.read(CHUNK)
+            t = {"predict": time.perf_counter()}
             scores = wake.predict(block[:, 0])
             if args.debug:
                 # one line every ~0.5 s with the loudest level and best score seen
@@ -362,33 +428,41 @@ def main():
                     peak_rms, peak_score, n = 0.0, 0.0, 0
             if scores.get(wake_key, 0) < WAKE_THRESHOLD:
                 continue
+            t["wake"] = time.perf_counter()
 
             doa = read_doa(doa_dev)    # before the chirp, so we get the speaker not ourselves
+            t["doa"] = time.perf_counter()
             where = f" from {doa[0]}\N{DEGREE SIGN}" if doa else " (direction unavailable)"
             print(f"\nWake word detected ({scores[wake_key]:.2f}){where}")
             pico.send({"mode": "listen", "deg": doa[0]} if doa else {"mode": "listen"})
             chirper.chirp(WAKE_CHIRP, 880)
-            audio = record_command(stream)
+            t["chirped"] = time.perf_counter()
+            audio, rec = record_command(stream)
+            t["rec_end"] = time.perf_counter()
             chirper.chirp(DONE_CHIRP, 660, blocking=False)   # plays while we transcribe
             pico.send({"mode": "think"})
+            t["think"] = time.perf_counter()
 
-            t0 = time.time()
             segments = whisper.transcribe(audio.astype(np.float32) / 32768.0)
+            t["transcribed"] = time.perf_counter()
             text = normalise(" ".join(s.text for s in segments))
-            print(f"  heard: '{text}'  ({len(audio) / RATE:.1f}s audio, "
-                  f"transcribed in {time.time() - t0:.2f}s)")
+            t["text"] = time.perf_counter()
+            print(f"  heard: '{text}'  ({len(audio) / RATE:.1f}s audio)")
 
             light = pico.light
             if text and not dispatch(text, pico):
                 print("  -> no matching command")
             if pico.light is light:     # no light command - leave "think" mode
                 pico.restore_light()
+            t["dispatched"] = time.perf_counter()
 
             # Clear wake-word state and drain audio buffered while we were busy,
             # so the chirp or the command itself doesn't re-trigger.
             wake.reset()
             while stream.read_available >= CHUNK:
                 stream.read(CHUNK)
+            t["drained"] = time.perf_counter()
+            timings.report(t, rec, input_latency)
             print(f"Listening for '{wake_key}'...")
 
 
