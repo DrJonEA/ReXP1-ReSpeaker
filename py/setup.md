@@ -184,6 +184,19 @@ When the wake word triggers, the script reads the reSpeaker's direction of arriv
 
 USB control needs permission. `install.sh` adds a udev rule that gives the `plugdev` group access to Seeed devices (vendor ID `2886`) and adds you to that group. Log out and back in, or unplug and replug the Flex, for it to take effect. If you see `DOA disabled` or `Access denied` at startup, the permission isn't active yet. The rest of the script still works without DOA.
 
+### Pico 2 LED ring
+
+The script sends the Pico 2 firmware in `../firmware` one JSON line per state change over USB serial:
+
+| When | Message |
+|---|---|
+| Wake word heard | `{"mode":"listen","deg":180}`, where `deg` is the speaker direction. It is left out if DOA is unavailable |
+| Command recorded, transcribing | `{"mode":"think"}` |
+| "Lights on" / "lights off" | `{"mode":"on"}` / `{"mode":"off"}` |
+| Any other command, or nothing heard | The current light state again, to end `think` |
+
+The Pico is found automatically by its USB vendor ID (`2E8A`). Use `--pico /dev/ttyACM0` to pick a port, or `--pico none` to disable it. If the Pico isn't connected, the script carries on and tries again on the next message. Opening the port needs the `dialout` group, which `install.sh` adds you to (log out and back in). `--debug` shows the messages sent (`pico<`) and what the firmware prints (`pico>`).
+
 ### Tuning (constants at the top of `voice_cmd.py`)
 
 | Setting | Effect |

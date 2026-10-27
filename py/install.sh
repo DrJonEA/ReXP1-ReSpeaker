@@ -14,6 +14,9 @@ echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="2886", GROUP="plugdev", MODE="0660"' \
 sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo usermod -aG plugdev "$USER"
 
+echo "== Serial access to the Pico 2 LED firmware (dialout group) =="
+sudo usermod -aG dialout "$USER"
+
 echo "== Python virtual environment (.venv) =="
 python3 -m venv .venv
 source .venv/bin/activate

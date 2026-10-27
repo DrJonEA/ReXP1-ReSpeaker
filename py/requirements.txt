@@ -12,6 +12,7 @@ sounddevice
 pywhispercpp
 ttastromech
 pyusb
+pyserial
 
 # openwakeword's runtime dependencies (minus tflite-runtime)
 onnxruntime

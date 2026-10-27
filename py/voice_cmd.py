@@ -7,21 +7,29 @@ Pipeline:
   2. On detection: report the speaker's direction (reSpeaker DOA over USB),
      astromech chirp, then record until the speaker goes quiet.
   3. whisper.cpp (via pywhispercpp) transcribes the recording.
-  4. The text is matched against COMMANDS (regex -> shell command) and the first match runs.
+  4. The text is matched against COMMANDS (regex -> shell command or Pico message) and the
+     first match runs.
+
+The Pico 2 firmware (../firmware) is sent one JSON line per state change over USB serial:
+  {"mode":"listen","deg":180}   wake word heard, deg = speaker direction (omitted if unknown)
+  {"mode":"think"}              transcribing / processing the command
+  {"mode":"on"} / {"mode":"off"}  light on or off, also sent to end "think" for other commands
 
 Setup (in a venv):
   sudo apt install python3-venv python3-dev build-essential cmake libportaudio2
   python3 -m venv ~/voice && source ~/voice/bin/activate
-  pip install numpy sounddevice openwakeword pywhispercpp ttastromech pyusb
+  pip install numpy sounddevice openwakeword pywhispercpp ttastromech pyusb pyserial
   python -c "import openwakeword.utils as u; u.download_models()"
 
 Run:
   python voice_cmd.py            # records from INPUT_DEVICE (the Flex's PipeWire source)
   python voice_cmd.py --list     # list audio devices ('>' marks default input, '<' default output)
   python voice_cmd.py --debug    # show live mic level and wake score
+  python voice_cmd.py --pico /dev/ttyACM0   # Pico serial port (default: auto-detect, 'none' to disable)
 """
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -37,6 +45,12 @@ try:
     from ttastromech import TTAstromech
 except ImportError:             # fall back to plain beeps
     TTAstromech = None
+
+try:
+    import serial
+    import serial.tools.list_ports
+except ImportError:             # pyserial not installed - no Pico
+    serial = None
 
 # Direction of arrival comes from Seeed's USB control example in the lib submodule.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib/reSpeaker_Flex/python_control"))
@@ -64,6 +78,11 @@ WHISPER_AUDIO_CTX = 384
 # wake model never fires on. Falls back to the system default if not found.
 INPUT_DEVICE = "alsa_input.usb-Seeed_Studio_reSpeaker_Flex"
 
+# Serial port of the Pico 2 running ../firmware. None = first USB device with the
+# Raspberry Pi vendor ID.
+PICO_PORT = None
+PICO_VID = 0x2E8A
+
 RATE = 16000                    # both openWakeWord and Whisper want 16 kHz mono
 CHUNK = 1280                    # 80 ms - the frame size openWakeWord expects
 
@@ -78,10 +97,11 @@ WAKE_CHIRP = "deki"             # played after the wake word, before recording
 DONE_CHIRP = "tuv"              # played when recording stops
 
 # Regex (matched against lower-cased text, punctuation stripped) -> command to run.
-# Use a list for the command (no shell), or a string to run through the shell.
+# Use a list for the command (no shell), a string to run through the shell, or a
+# dict to send to the Pico as JSON.
 COMMANDS = [
-    (r"\b(lights?|lamp) on\b",          ["echo", "TODO: turn lights on"]),
-    (r"\b(lights?|lamp) off\b",         ["echo", "TODO: turn lights off"]),
+    (r"\b(lights?|lamp) on\b",          {"mode": "on"}),
+    (r"\b(lights?|lamp) off\b",         {"mode": "off"}),
     (r"\bwhat time is it\b|\bthe time\b", "date '+%H:%M'"),
     (r"\b(volume|turn it) up\b",        ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "10%+"]),
     (r"\b(volume|turn it) down\b",      ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "10%-"]),
@@ -161,7 +181,68 @@ def read_doa(dev):
     except Exception as e:          # never let DOA kill the loop
         print(f"[DOA read failed: {e}]", file=sys.stderr)
         return None
-    return r[1] + r[2] * 256, bool(r[3])
+    angle = r[1] + r[2] * 256
+    # The reSpeaker measures the opposite way round to the LED ring, so invert it.
+    return (360 - angle) % 360, bool(r[3])
+
+
+class Pico:
+    """JSON lines to the Pico 2 firmware over USB serial. Never raises: if the Pico is
+    missing or unplugged, messages are dropped and the port is reopened on the next send."""
+
+    def __init__(self, port=None, debug=False):
+        self.port, self.debug = port, debug
+        self.ser = None
+        self.light = {"mode": "off"}   # last light state; the firmware starts off
+        if serial is None:
+            print("Pico disabled: pyserial not installed")
+            self.port = "none"
+        elif self.open():
+            print(f"Pico on {self.ser.port}")
+        else:
+            print("Pico not found - will keep trying")
+
+    def find(self):
+        if self.port:
+            return self.port
+        for p in serial.tools.list_ports.comports():
+            if p.vid == PICO_VID:
+                return p.device
+        return None
+
+    def open(self):
+        port = self.find()
+        if port is None:
+            return False
+        try:
+            self.ser = serial.Serial(port, 115200, timeout=0, write_timeout=1)
+        except Exception as e:
+            print(f"[Pico open {port} failed: {e}]", file=sys.stderr)
+            self.ser = None
+        return self.ser is not None
+
+    def send(self, msg: dict):
+        if self.port == "none" or (self.ser is None and not self.open()):
+            return
+        if msg.get("mode") in ("on", "off"):
+            self.light = msg
+        line = json.dumps(msg, separators=(",", ":")) + "\n"
+        try:
+            # Drain what the firmware prints so its USB output never backs up.
+            pending = self.ser.read(self.ser.in_waiting or 0)
+            if self.debug and pending:
+                print(f"  pico> {pending.decode(errors='replace').strip()}")
+            self.ser.write(line.encode())
+            if self.debug:
+                print(f"  pico< {line.strip()}")
+        except Exception as e:
+            print(f"[Pico write failed: {e}]", file=sys.stderr)
+            self.ser.close()
+            self.ser = None
+
+    def restore_light(self):
+        """Leave "think" mode by re-sending the current light state."""
+        self.send(self.light)
 
 
 def rms(block: np.ndarray) -> float:
@@ -197,9 +278,13 @@ def normalise(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def dispatch(text: str) -> bool:
+def dispatch(text: str, pico: Pico) -> bool:
     for pattern, cmd in COMMANDS:
         if re.search(pattern, text):
+            if isinstance(cmd, dict):
+                print(f"  -> match {pattern!r}: sending {cmd} to Pico")
+                pico.send(cmd)
+                return True
             print(f"  -> match {pattern!r}: running {cmd}")
             try:
                 result = subprocess.run(cmd, shell=isinstance(cmd, str),
@@ -222,6 +307,8 @@ def main():
     ap.add_argument("--list", action="store_true", help="list audio devices and exit")
     ap.add_argument("--device", default=INPUT_DEVICE, help=f"input device name/index (default: {INPUT_DEVICE})")
     ap.add_argument("--debug", action="store_true", help="print live mic level and wake score")
+    ap.add_argument("--pico", default=PICO_PORT,
+                    help="Pico serial port (default: auto-detect, 'none' to disable)")
     args = ap.parse_args()
     if args.device is not None and args.device.isdigit():
         args.device = int(args.device)   # sounddevice treats a str as a name match
@@ -245,6 +332,8 @@ def main():
         print("ttastromech not installed - using beeps")
 
     doa_dev = open_respeaker()
+    pico = Pico(args.pico, debug=args.debug)
+    pico.restore_light()
 
     print(f"Loading whisper.cpp model {WHISPER_MODEL}...")
     whisper = WhisperModel(WHISPER_MODEL, n_threads=WHISPER_THREADS,
@@ -277,9 +366,11 @@ def main():
             doa = read_doa(doa_dev)    # before the chirp, so we get the speaker not ourselves
             where = f" from {doa[0]}\N{DEGREE SIGN}" if doa else " (direction unavailable)"
             print(f"\nWake word detected ({scores[wake_key]:.2f}){where}")
+            pico.send({"mode": "listen", "deg": doa[0]} if doa else {"mode": "listen"})
             chirper.chirp(WAKE_CHIRP, 880)
             audio = record_command(stream)
             chirper.chirp(DONE_CHIRP, 660, blocking=False)   # plays while we transcribe
+            pico.send({"mode": "think"})
 
             t0 = time.time()
             segments = whisper.transcribe(audio.astype(np.float32) / 32768.0)
@@ -287,8 +378,11 @@ def main():
             print(f"  heard: '{text}'  ({len(audio) / RATE:.1f}s audio, "
                   f"transcribed in {time.time() - t0:.2f}s)")
 
-            if text and not dispatch(text):
+            light = pico.light
+            if text and not dispatch(text, pico):
                 print("  -> no matching command")
+            if pico.light is light:     # no light command - leave "think" mode
+                pico.restore_light()
 
             # Clear wake-word state and drain audio buffered while we were busy,
             # so the chirp or the command itself doesn't re-trigger.
