@@ -282,7 +282,7 @@ class Timings:
     def __init__(self):
         self.history = {}           # metric -> list of ms values, one per command
 
-    def report(self, t, rec, input_latency):
+    def report(self, text, t, rec, input_latency):
         ms = lambda a, b: (t[b] - t[a]) * 1000
         # The last block read is (almost) live, so end of speech was trailing_quiet
         # seconds of audio plus the input buffer latency before recording stopped.
@@ -306,7 +306,7 @@ class Timings:
         ]
         audio_s = rec["duration"]
         first = rec["first_speech"]
-        print("  timings:")
+        print(f"  timings for '{text}':")
         for name, v in rows:
             print(f"    {name:<30}{v:8.0f} ms")
         print(f"    {'':<30}clip {audio_s * 1000:.0f} ms: speech {rec['speech'] * 1000:.0f} ms, "
@@ -447,7 +447,8 @@ def main():
             t["transcribed"] = time.perf_counter()
             text = normalise(" ".join(s.text for s in segments))
             t["text"] = time.perf_counter()
-            print(f"  heard: '{text}'  ({len(audio) / RATE:.1f}s audio)")
+            print(f"  heard: '{text}'  ({len(audio) / RATE:.1f}s audio, "
+                  f"transcribed in {t['transcribed'] - t['think']:.2f}s)")
 
             light = pico.light
             if text and not dispatch(text, pico):
@@ -462,7 +463,7 @@ def main():
             while stream.read_available >= CHUNK:
                 stream.read(CHUNK)
             t["drained"] = time.perf_counter()
-            timings.report(t, rec, input_latency)
+            timings.report(text, t, rec, input_latency)
             print(f"Listening for '{wake_key}'...")
 
 
