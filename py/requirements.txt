@@ -1,0 +1,21 @@
+# Python dependencies for voice_cmd.py
+# Install with ./install.sh (recommended), or manually:
+#   pip install -r requirements.txt
+#   pip install --no-deps "openwakeword>=0.6"
+#
+# openwakeword is installed separately with --no-deps because on Linux it
+# depends on tflite-runtime, which has no wheels for recent Python versions.
+# We use its ONNX backend instead, so its other dependencies are listed here.
+
+numpy
+sounddevice
+pywhispercpp
+ttastromech
+pyusb
+
+# openwakeword's runtime dependencies (minus tflite-runtime)
+onnxruntime
+scipy
+scikit-learn
+tqdm
+requests

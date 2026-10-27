@@ -1,0 +1,9 @@
+[submodule "lib/reSpeaker_Flex"]
+	path = lib/reSpeaker_Flex
+	url = https://github.com/respeaker/reSpeaker_Flex
+[submodule "lib/PicoLED"]
+	path = lib/PicoLED
+	url = https://github.com/ForsakenNGS/PicoLED
+[submodule "lib/tiny-json"]
+	path = lib/tiny-json
+	url = https://github.com/rafagafe/tiny-json
